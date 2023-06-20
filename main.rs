@@ -1,12 +1,16 @@
-use actix_web::{web, App, Error, HttpResponse, HttpServer};
-use bollard::container::{Config, StartContainerOptions, RemoveContainerOptions};
+use actix_web::{web, App, Error, HttpResponse, HttpServer, HttpRequest, http::StatusCode};
+use bollard::container::{AttachContainerOptions, AttachContainerResults, Config, LogOutput, ResizeContainerTtyOptions};
 use bollard::Docker;
 use bollard::image::CreateImageOptions;
-use futures_util::{StreamExt, TryStreamExt};
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use futures_util::{StreamExt, SinkExt, TryStreamExt};
+use tokio::io::{AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 use std::str::FromStr;
+use tokio_tungstenite::accept_async;
+use actix_web::web::Bytes;
+use tokio::net::TcpStream;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 const IMAGE: &str = "alpine:3";
 
@@ -21,10 +25,10 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-async fn ws_route(req: web::HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
+async fn ws_route(req: HttpRequest, _: web::Payload) -> Result<HttpResponse, Error> {
     let id = req.match_info().get("id").unwrap_or("alpine");
 
-    let docker = Docker::connect_with_local_defaults().unwrap();
+    let docker = Docker::connect_with_socket_defaults().unwrap();
 
     docker
         .create_image(
@@ -57,33 +61,61 @@ async fn ws_route(req: web::HttpRequest, stream: web::Payload) -> Result<HttpRes
 
     docker.start_container::<String>(&id, None).await.unwrap();
 
-    let (response, mut ws) = actix_tungstenite::start_with_protocols(req, stream, &["docker"]).unwrap();
+    let AttachContainerResults { mut output, mut input } = docker
+        .attach_container(
+            &id,
+            Some(AttachContainerOptions::<String> {
+                stdout: Some(true),
+                stderr: Some(true),
+                stdin: Some(true),
+                stream: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
+    let stream = TcpStream::connect("127.0.0.1:8080").await.unwrap();
+    let ws = Arc::new(Mutex::new(accept_async(stream).await.unwrap()));
+
+    let ws_in = Arc::clone(&ws);
     actix_web::rt::spawn(async move {
-        while let Some(Ok(msg)) = ws.next().await {
+        while let Some(Ok(msg)) = ws_in.lock().await.next().await {
             match msg {
                 Message::Text(text) => {
-                    let _ = input.write_all(text.as_bytes()).await;
+                    if let Err(e) = input.write_all(text.as_bytes()).await {
+                        eprintln!("Error writing to input: {}", e);
+                    }
                 }
                 Message::Binary(bin) => {
-                    let size: Vec<&str> = std::str::from_utf8(&bin).unwrap().split(':').collect();
-                    if size.len() == 2 {
-                        if let (Ok(h), Ok(w)) = (u16::from_str(size[0]), u16::from_str(size[1])) {
-                            let _ = docker.resize_container(&id, Some(ResizeContainerOptions { h, w })).await;
-                        }
-                    }
+                    let size: Vec<&str> = std::str::from_utf8(&bin).unwrap().split(',').collect();
+                    let height: u16 = u16::from_str(size[0]).unwrap();
+                    let width: u16 = u16::from_str(size[1]).unwrap();
+                    let _ = docker
+                        .resize_container_tty(
+                            &id,
+                            ResizeContainerTtyOptions { width, height },
+                        )
+                        .await;
                 }
                 _ => {}
             }
         }
     });
 
+    let ws_out = Arc::clone(&ws);
     actix_web::rt::spawn(async move {
-        let mut buffer = [0; 1024];
-        while let Ok(message) = output.read(&mut buffer).await {
-            let _ = ws.send(Message::Binary(buffer.to_vec())).await;
+        while let Some(Ok(data)) = output.next().await {
+            match data {
+                LogOutput::StdOut { message: bytes } | LogOutput::StdErr { message: bytes } => {
+                    if let Err(e) = ws_out.lock().await.send(Message::Binary(Bytes::from(bytes).to_vec())).await {
+                        eprintln!("Error sending WebSocket message: {}", e);
+                    }
+                },
+                _ => {}
+            }
         }
     });
 
-    Ok(response)
+    Ok(HttpResponse::build(StatusCode::OK).finish())
 }
