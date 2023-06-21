@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Terminal</title>
+    <link rel="stylesheet" href="https://unpkg.com/xterm/css/xterm.css" />
+    <script src="https://unpkg.com/xterm"></script>
+    <script src="https://unpkg.com/xterm-addon-fit"></script>
+</head>
+<body>
+    <div id="terminal"></div>
+    <script>
+        var term = new Terminal();
+        var socket = new WebSocket('ws://192.172.244.9:8080/ws/test_container');
+
+        term.open(document.getElementById('terminal'));
+
+        socket.onmessage = function (event) {
+            term.write(event.data);
+        }
+
+		let commandBuffer = '';
+
+		term.onData(data => {
+			if (data === '\r') { // '\r' is the Enter key
+				socket.send(commandBuffer);
+				term.write('\r\n'); // Move to the next line
+				commandBuffer = '';
+			} else {
+				commandBuffer += data;
+				term.write(data); // Display the input
+			}
+		});
+
+        // Fit the terminal to the size of the div
+        var fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        fitAddon.fit();
+
+    </script>
+</body>
+</html>

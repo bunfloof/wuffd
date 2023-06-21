@@ -37,8 +37,7 @@ impl Handler<ExecuteCommand> for MyWebSocket {
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(true),
-            cmd: Some(vec!["/bin/sh".to_string(), "-c".to_string(), msg.0.clone()]),
-            //cmd: Some(vec![msg.0]),
+            cmd: Some(vec![msg.0]),
             ..Default::default()
         };
     
@@ -107,7 +106,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new().route("/ws/{id}", web::get().to(ws_index))
     })
-    .bind("0.0.0.0:8080")?
+    .bind("127.0.0.1:8080")?
     .run()
     .await
 }
